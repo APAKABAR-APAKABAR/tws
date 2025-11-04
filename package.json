@@ -1,0 +1,11 @@
+{
+  "name": "wa-bot-pairing",
+  "version": "1.0.0", 
+  "type": "module",
+  "dependencies": {
+    "@whapi/baileys": "^6.5.0"
+  },
+  "scripts": {
+    "start": "node index.js"
+  }
+}
