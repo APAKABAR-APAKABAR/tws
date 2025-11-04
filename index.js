@@ -1,120 +1,172 @@
 const {
   default: makeWASocket,
   useMultiFileAuthState,
+  makeInMemoryStore,
+  jidDecode,
   PHONENUMBER_MCC,
-} = require('@whiskeysockets/baileys')
-const readline = require('readline')
+  DisconnectReason,
+} = require("@whiskeysockets/baileys");
+const readline = require("readline");
+const fs = require("fs-extra");
 
 // Session
-const session = 'auth'
-const pairingCode = true
+const sessionName = "session";
+const pairingCode = true; // Selalu pakai pairing code
 
-// Untuk input nomor
 const rl = readline.createInterface({
   input: process.stdin,
   output: process.stdout,
-})
-const question = (text) => new Promise((resolve) => rl.question(text, resolve))
+});
+const question = (text) => new Promise((resolve) => rl.question(text, resolve));
 
-async function connectWA() {
-  const { state, saveCreds } = await useMultiFileAuthState(session)
+const store = makeInMemoryStore({
+  logger: {
+    level: "silent"
+  }
+});
+
+async function startServer() {
+  const { state, saveCreds } = await useMultiFileAuthState("./" + sessionName);
   
-  const socket = makeWASocket({
-    printQRInTerminal: false, // Pakai pairing code
-    logger: { level: 'silent' },
+  const conn = makeWASocket({
+    printQRInTerminal: false, // Tidak pakai QR, pakai pairing code
+    logger: {
+      level: "silent"
+    },
+    browser: ["Chrome (Linux)", "", ""],
     auth: state,
-    markOnlineOnConnect: false, // BEKUKAN LAST SEEN
+    markOnlineOnConnect: false, // ✅ BEKUKAN LAST SEEN
     syncFullHistory: false,
-    shouldIgnoreJid: jid => jid?.endsWith('@g.us'), // Optional: ignore group sync
-  })
+    connectTimeoutMs: 60000,
+    keepAliveIntervalMs: 10000,
+    emitOwnEvents: false,
+    fireInitQueries: false,
+    generateHighQualityLinkPreview: false,
+  });
+
+  conn.ev.on("creds.update", saveCreds);
 
   // Pairing Code System
-  if (pairingCode && !socket.authState.creds.registered) {
-    let phoneNumber = await question('Masukkan nomor WA (62/08): ')
-    phoneNumber = phoneNumber.replace(/[^0-9]/g, "")
+  if (pairingCode && !conn.authState.creds.registered) {
+    console.log("╭──────────────────────────────────────");
+    console.log("📨 Masukkan nomor WhatsApp:");
+    console.log("├──────────────────────────────────────");
+    let phoneNumber = await question(`   - Nomor: `);
+    console.log("╰──────────────────────────────────────");
+    
+    phoneNumber = phoneNumber.replace(/[^0-9]/g, "");
     
     // Format nomor
     if (phoneNumber.startsWith('0')) {
-      phoneNumber = '62' + phoneNumber.substring(1)
+      phoneNumber = '62' + phoneNumber.substring(1);
     }
     if (!phoneNumber.startsWith('62')) {
-      phoneNumber = '62' + phoneNumber
+      phoneNumber = '62' + phoneNumber;
     }
 
-    console.log(`🔢 Menggunakan nomor: ${phoneNumber}`)
+    if (!Object.keys(PHONENUMBER_MCC).some((v) => phoneNumber.startsWith(v))) {
+      console.log("╭──────────────────────────────────────");
+      console.log("❌ Format salah! Contoh: 628123456789");
+      console.log("╰──────────────────────────────────────");
+      phoneNumber = await question(`   - Nomor: `);
+      phoneNumber = phoneNumber.replace(/[^0-9]/g, "");
+    }
 
-    setTimeout(async () => {
-      try {
-        const code = await socket.requestPairingCode(phoneNumber)
-        console.log('\n═══════════════════════════════')
-        console.log('📱 PAIRING CODE: ' + code)
-        console.log('═══════════════════════════════')
-        console.log('WhatsApp → Linked Devices → Link a Device')
-        console.log('═══════════════════════════════\n')
-      } catch (error) {
-        console.log('❌ Gagal meminta pairing code')
-      }
-    }, 3000)
+    const code = await conn.requestPairingCode(phoneNumber);
+    const formattedCode = code?.match(/.{1,4}/g)?.join("-") || code;
+    
+    console.log("╭──────────────────────────────────────");
+    console.log("📱 PAIRING CODE:");
+    console.log("├──────────────────────────────────────");
+    console.log(`   - Code: ${formattedCode}`);
+    console.log("╰──────────────────────────────────────");
+    console.log("💡 Cara: WhatsApp → Linked Devices → Link a Device");
+    rl.close();
   }
 
-  // Handle connection
-  socket.ev.on("connection.update", ({ connection, lastDisconnect }) => {
-    if (connection === "open") {
-      console.log('✅ BERHASIL TERHUBUNG!')
-      console.log('📱 Status: ONLINE')
-      console.log('👀 Last Seen: BEKU/DIBEKUKAN')
-      console.log('✓ Centang 1: AKTIF')
-      rl.close()
-      
-      // Test kirim pesan ke sendiri
-      setTimeout(async () => {
-        try {
-          await socket.sendMessage(socket.user.id, { 
-            text: '🤖 Bot sudah aktif!\n• Last Seen: Beku\n• Centang 1: Aktif\n• Status: Online' 
-          })
-        } catch (e) {}
-      }, 2000)
-    }
-    
-    if (connection === "close") {
-      if (lastDisconnect?.error?.output?.statusCode !== 401) {
-        setTimeout(connectWA, 5000)
-      }
-    }
-  })
+  store.bind(conn.ev);
 
-  // Save credentials
-  socket.ev.on("creds.update", saveCreds)
+  // Handle messages - TANPA BACA PESAN (CENTANG 1)
+  conn.ev.on("messages.upsert", async (chatUpdate) => {
+    try {
+      const m = chatUpdate.messages[0];
+      if (!m.message) return;
+      
+      // JANGAN baca pesan - biarkan CENTANG 1
+      // Tidak pakai readMessages() atau markRead()
+      
+      m.message = Object.keys(m.message)[0] === "ephemeralMessage"
+        ? m.message.ephemeralMessage.message
+        : m.message;
 
-  // Handle incoming messages - CENTANG 1 SAJA
-  socket.ev.on('messages.upsert', async ({ messages }) => {
-    const m = messages[0]
-    
-    // JANGAN baca pesan (biarkan centang 1)
-    // Tidak pakai readMessages() agar tetap centang 1
-    
-    if (m.message) {
-      const from = m.key.remoteJid
-      const msgType = Object.keys(m.message)[0]
-      const msgText = m.message.conversation || m.message.extendedTextMessage?.text || ''
+      if (m.key && m.key.remoteJid === "status@broadcast") return;
+      if (m.key.id.startsWith("BAE5") && m.key.id.length === 16) return;
+
+      const from = m.key.remoteJid;
+      const msgText = m.message.conversation || m.message.extendedTextMessage?.text || '';
       
-      console.log(`📨 Pesan dari ${from}: ${msgText}`)
-      
-      // Auto reply tapi TANPA baca pesan (biarkan centang 1)
+      console.log(`📨 Pesan dari ${from}: ${msgText}`);
+
+      // Auto reply TANPA baca pesan (tetap centang 1)
       if (msgText.toLowerCase() === 'ping') {
-        await socket.sendMessage(from, { text: 'Pong! 🏓' })
-        // Tetap centang 1 karena tidak pakai readMessages()
+        await conn.sendMessage(from, { text: '🏓 Pong!' });
       }
       
       if (msgText.toLowerCase() === 'status') {
-        await socket.sendMessage(from, { 
-          text: '📊 Status Bot:\n• ✅ Online\n• 👀 Last Seen: Beku\n• ✓ Centang 1: Aktif\n• 📨 Pesan terbaca: Tidak' 
-        })
+        await conn.sendMessage(from, { 
+          text: '📊 Status Bot:\n• ✅ Online\n• 👀 Last Seen: Beku\n• ✓ Centang 1: Aktif\n• 📨 Pesan tidak dibaca' 
+        });
+      }
+
+    } catch (err) {
+      console.log("Error:", err);
+    }
+  });
+
+  // Connection update
+  conn.ev.on("connection.update", async (update) => {
+    const { connection, lastDisconnect } = update;
+    const code = lastDisconnect?.error?.output?.statusCode ||
+                lastDisconnect?.error?.output?.payload?.statusCode;
+
+    if (connection === "close") {
+      if (code !== DisconnectReason.loggedOut) {
+        console.log("🔌 Koneksi terputus, reconnect...");
+        setTimeout(startServer, 5000);
+      } else {
+        console.log("❌ Logged out");
       }
     }
-  })
+
+    if (connection === "open") {
+      console.log("╭──────────────────────────────────────");
+      console.log("✅ BERHASIL TERHUBUNG!");
+      console.log("├──────────────────────────────────────");
+      console.log("📱 Status: ONLINE");
+      console.log("👀 Last Seen: BEKU/DIBEKUKAN");
+      console.log("✓ Centang 1: AKTIF");
+      console.log("╰──────────────────────────────────────");
+    }
+  });
+
+  // Helper functions
+  conn.decodeJid = (jid) => {
+    if (!jid) return jid;
+    if (/:\d+@/gi.test(jid)) {
+      let decode = jidDecode(jid) || {};
+      return ((decode.user && decode.server && decode.user + "@" + decode.server) || jid);
+    } else return jid;
+  };
+
+  conn.sendText = (jid, text, quoted = "", options) => {
+    return conn.sendMessage(
+      jid,
+      { text: text, ...options },
+      { quoted, ...options }
+    );
+  };
 }
 
-// Jalankan
-console.log('🚀 Starting WhatsApp Bot...')
-connectWA().catch(console.error)
+// Start bot
+console.log("🚀 Starting WhatsApp Bot...");
+startServer().catch(console.error);
